@@ -351,6 +351,65 @@ void LaneDetector::ExtractLaneFeatures(const oimage::OImagePtrVector& input_oima
   return;
 }
 
+
+
+void LaneDetector::ApplyMatchedFilterFrontCamera(const cv::Mat& input_mat,
+                                                 const math::Plane& ground_plane,
+                                                 const oimage::CameraIntrinsics& intrinsics,
+                                                 cv::Mat* filtered_x, cv::Mat* filtered_y)
+{
+  // Initialize output mats.
+  *filtered_x = cv::Mat::zeros(input_mat.size(), CV_32F);
+  *filtered_y = cv::Mat::zeros(input_mat.size(), CV_32F);
+
+  Matrix3d K;
+  K << intrinsics.fx, 0, intrinsics.cx, 0, intrinsics.fy, intrinsics.cy, 0, 0, 1;
+
+  // Compute the filter size at bottom of image (largest).
+  Matrix3d Kinv = K.inverse();
+  Vector3d X_h = Kinv * Vector3d(0.5 * input_mat.cols, input_mat.rows, 1.0);
+  double z_cam = -1 * ground_plane.D() / (X_h.transpose() * ground_plane.Normal());
+  int lane_half_width_px = std::floor(0.5 * params_.lane_width * intrinsics.fx / z_cam);
+
+  int maxRowIndex = input_mat.rows;  // Exclusive.
+  int validFilterRows =
+      std::ceil(-2 * ground_plane.D() / (params_.lane_width * intrinsics.fx * Kinv(0, 0)));
+  int minRowIndex = maxRowIndex - validFilterRows;  // Inclusive.
+
+  // TODO: assert that validFilterRows >= 1!
+
+  while (lane_half_width_px >= 1) {
+    // Find the range of rows for the next kernel size.
+    minRowIndex = maxRowIndex - validFilterRows;
+
+    cv::Mat filter_x = cv::Mat::ones(cv::Size(4 * lane_half_width_px + 1, 1), CV_32F);
+    cv::Mat filter_y = cv::Mat::ones(cv::Size(1, 4 * lane_half_width_px + 1), CV_32F);
+
+    filter_x.colRange(0, lane_half_width_px).setTo(-1);
+    filter_x.colRange(3 * lane_half_width_px + 1, 4 * lane_half_width_px + 1).setTo(-1);
+
+    filter_y.rowRange(0, lane_half_width_px).setTo(-1);
+    filter_y.rowRange(3 * lane_half_width_px + 1, 4 * lane_half_width_px + 1).setTo(-1);
+
+    // Apply x filter only along the row.
+    cv::filter2D(input_mat.rowRange(minRowIndex, maxRowIndex),
+                 filtered_x->rowRange(minRowIndex, maxRowIndex), CV_32F, filter_x,
+                 cv::Point(-1, -1), 0, cv::BORDER_REPLICATE);
+
+    // Apply the y filter along a strip.
+    cv::filter2D(input_mat.rowRange(minRowIndex, maxRowIndex),
+                 filtered_y->rowRange(minRowIndex, maxRowIndex), CV_32F, filter_y,
+                 cv::Point(-1, -1), 0, cv::BORDER_REPLICATE);
+
+    // Move on to the next kernel size, and shift the rows to apply filter to.
+    maxRowIndex = minRowIndex;
+    lane_half_width_px -= 1;
+  }
+
+  return;
+}
+
+
 // void LaneDetector::ProcessImages(const oimage::OImagePtrVector& input_oimages,
 //                                  oimage::OImagePtr detection_oimage)
 // {
@@ -405,6 +464,179 @@ void LaneDetector::ExtractLaneFeatures(const oimage::OImagePtrVector& input_oima
 //   detection_oimage = oimage::CVWrapMat(&roi_mask, oimage::FourCC::GRAY);
 //   return;
 // }
+
+void LaneDetector::ExtractLaneFeaturesLocalizationMap(const LocalizationMapPtr& localization_map,
+                                                      // const std::vector<FrameUpdate>& /*optimized_poses*/,
+                                                      std::vector<curves2d::ASpline>* /*detected_lanes*/)
+{
+  // Convert localization map to cv::Mat.
+  cv::Mat1b localization_mat;
+  ConvertTiledMapToImage(localization_map->GetMap(), &localization_mat);
+
+  // Apply the matched filter to find lanelines.
+  const float laneline_width_meters = 0.2;
+  const float cell_size_meters = static_cast<float>(localization_map->GetMapOptions().cell_size);
+  const int laneline_width_px = static_cast<int>(std::round(laneline_width_meters / cell_size_meters));
+
+  // printf("Width meters: %f Cell size meters: %f Width px: %d\n",
+  //   laneline_width_meters, cell_size_meters, laneline_width_px);
+
+  cv::Mat matched_filter_x = cv::Mat::zeros(localization_mat.size(), CV_32FC1);
+  cv::Mat matched_filter_y = cv::Mat::zeros(localization_mat.size(), CV_32FC1);
+  cv::Mat matched_mag = cv::Mat::zeros(localization_mat.size(), CV_32FC1);
+
+  ApplyMatchedFilterOverhead(localization_mat, laneline_width_px, &matched_filter_x,
+                             &matched_filter_y, &matched_mag);
+
+  cv::namedWindow("original", cv::WINDOW_NORMAL);
+  cv::imshow("original", localization_mat);
+
+  cv::Mat1b matched_thresh = cv::Mat::zeros(matched_mag.size(), CV_8UC1);
+  matched_thresh = (matched_mag > 0.60);
+
+  cv::namedWindow("mthresh", cv::WINDOW_NORMAL);
+  cv::imshow("mthresh", matched_thresh);
+
+  // Apply another filter to get lane boundaries.
+  cv::Mat boundary_filter_x = cv::Mat::zeros(localization_mat.size(), CV_32FC1);
+  cv::Mat boundary_filter_y = cv::Mat::zeros(localization_mat.size(), CV_32FC1);
+  cv::Mat boundary_mag = cv::Mat::zeros(localization_mat.size(), CV_32FC1);
+  ApplyBoundaryFilterOverhead(localization_mat, 10, 6, &boundary_filter_x, &boundary_filter_y,
+                              &boundary_mag);
+
+  cv::namedWindow("boundaries", cv::WINDOW_NORMAL);
+  cv::imshow("boundaries", boundary_mag);
+
+  cv::Mat1b boundary_thresh = cv::Mat::zeros(boundary_mag.size(), CV_8UC1);
+  boundary_thresh = (boundary_mag > 0.40);
+
+  cv::namedWindow("bthresh", cv::WINDOW_NORMAL);
+  cv::imshow("bthresh", boundary_thresh);
+
+  // Apply the boundary filter output as a mask on the original grid.
+  cv::Mat masked;
+  localization_mat.copyTo(masked, boundary_thresh);
+
+  cv::namedWindow("masked", cv::WINDOW_NORMAL);
+  cv::imshow("masked", masked | matched_thresh);
+
+  cv::Mat stats, centroids;
+  cv::Mat labels = cv::Mat::zeros(matched_thresh.size(), CV_32S);
+  int numComp = cv::connectedComponentsWithStats(matched_thresh, labels, stats, centroids, 8, CV_32S);
+
+  std::vector<int> valid_components;
+  for (int ii = 0; ii < numComp; ii++) {
+    if (stats.at<int>(ii, cv::CC_STAT_AREA) > 10) {
+      valid_components.push_back(ii);
+    }
+  }
+
+  printf("Valid comp: %zu\n", valid_components.size());
+
+  cv::Mat valid = cv::Mat::zeros(matched_thresh.size(), CV_8UC1);
+  for (size_t jj = 1; jj < valid_components.size(); jj++) {
+    valid[labels == valid_components[jj]] = 255;
+  }
+
+  cv::namedWindow("label", cv::WINDOW_NORMAL);
+  cv::imshow("label", valid);
+
+  cv::waitKey(0);
+
+  return;
+}
+
+void ApplyBoundaryFilterOverhead(const cv::Mat1b& input_mat, const int lane_px,
+                                 const int boundary_px, cv::Mat* filtered_x, cv::Mat* filtered_y,
+                                 cv::Mat* magnitude)
+{
+  // Initialize output mats.
+  cv::Mat filter_left_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+  cv::Mat filter_right_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+
+  cv::Mat filter_upper_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+  cv::Mat filter_lower_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+
+  cv::Mat magnitude_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+
+  // Templates for right and left edges, respectively.
+  cv::Mat filter_right = cv::Mat::ones(cv::Size(lane_px + boundary_px, lane_px), CV_32FC1);
+  cv::Mat filter_left = cv::Mat::ones(cv::Size(lane_px + boundary_px, lane_px), CV_32FC1);
+
+  // Filter for upper and lower edges, respectively.
+  cv::Mat filter_upper = cv::Mat::ones(cv::Size(lane_px, lane_px + boundary_px), CV_32FC1);
+  cv::Mat filter_lower = cv::Mat::ones(cv::Size(lane_px, lane_px + boundary_px), CV_32FC1);
+
+  filter_left.colRange(0, lane_px).setTo(-1 * boundary_px / lane_px);
+  filter_right.colRange(boundary_px, boundary_px + lane_px).setTo(-1 * boundary_px / lane_px);
+
+  filter_lower.rowRange(0, lane_px).setTo(-1 * boundary_px / lane_px);
+  filter_upper.rowRange(boundary_px, boundary_px + lane_px).setTo(-1 * boundary_px / lane_px);
+
+  cv::filter2D(input_mat, filter_left_raw, CV_32F, filter_left, cv::Point(lane_px, lane_px / 2), 0,
+               cv::BORDER_REPLICATE);
+
+  cv::filter2D(input_mat, filter_right_raw, CV_32F, filter_right,
+               cv::Point(boundary_px, lane_px / 2), 0, cv::BORDER_REPLICATE);
+
+  cv::filter2D(input_mat, filter_upper_raw, CV_32F, filter_upper,
+               cv::Point(lane_px / 2, boundary_px), 0, cv::BORDER_REPLICATE);
+
+  cv::filter2D(input_mat, filter_lower_raw, CV_32F, filter_lower, cv::Point(lane_px / 2, lane_px),
+               0, cv::BORDER_REPLICATE);
+
+  // Normalize to [0, 1].
+  cv::Mat filter_x_raw = cv::max(filter_left_raw, filter_right_raw);
+  cv::Mat filter_y_raw = cv::max(filter_upper_raw, filter_lower_raw);
+  cv::normalize(filter_x_raw, *filtered_x, 0, 1, cv::NORM_MINMAX);
+  cv::normalize(filter_y_raw, *filtered_y, 0, 1, cv::NORM_MINMAX);
+
+  cv::addWeighted(filter_x_raw, 0.5, filter_y_raw, 0.5, 0.0, magnitude_raw);
+  cv::normalize(magnitude_raw, *magnitude, 0, 1, cv::NORM_MINMAX);
+
+  return;
+}
+
+void ApplyMatchedFilterOverhead(const cv::Mat1b& input_mat, const int laneline_width_px,
+                                const int support_px, cv::Mat* filtered_x, cv::Mat* filtered_y,
+                                cv::Mat* magnitude)
+{
+  // Initialize output mats.
+  cv::Mat filter_x_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+  cv::Mat filter_y_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+  cv::Mat magnitude_raw = cv::Mat::zeros(input_mat.size(), CV_32FC1);
+
+  const int lane_half_width_px = std::max(1, laneline_width_px / 2);
+
+  int filterSize = 2 * lane_half_width_px + 1 + 2 * support_px;
+  cv::Mat filter_x = cv::Mat::ones(cv::Size(filterSize, 5), CV_32F);
+  cv::Mat filter_y = cv::Mat::ones(cv::Size(5, filterSize), CV_32F);
+
+  // const float filterNegVal = -1.0 * (1.0 + (1.0 / (2.0 * (float)lane_half_width_px)));
+  const float filterNegVal = -1.0f * (2 * (float)lane_half_width_px + 1) / (2 * (float)support_px);
+
+  int upperSupportIdx = 2 * lane_half_width_px + 1 + support_px;
+
+  filter_x.colRange(0, support_px).setTo(filterNegVal);
+  filter_x.colRange(upperSupportIdx, filterSize).setTo(filterNegVal);
+
+  filter_y.rowRange(0, lane_half_width_px).setTo(filterNegVal);
+  filter_y.rowRange(upperSupportIdx, filterSize).setTo(filterNegVal);
+
+  cv::filter2D(input_mat, filter_x_raw, CV_32F, filter_x, cv::Point(-1, -1), 0,
+               cv::BORDER_REPLICATE);
+  cv::filter2D(input_mat, filter_y_raw, CV_32F, filter_y, cv::Point(-1, -1), 0,
+               cv::BORDER_REPLICATE);
+
+  // Normalize to [0, 1].
+  cv::normalize(filter_x_raw, *filtered_x, 0, 1, cv::NORM_MINMAX);
+  cv::normalize(filter_y_raw, *filtered_y, 0, 1, cv::NORM_MINMAX);
+
+  cv::addWeighted(filter_x_raw, 0.5, filter_y_raw, 0.5, 0.0, magnitude_raw);
+  cv::normalize(magnitude_raw, *magnitude, 0, 1, cv::NORM_MINMAX);
+
+  return;
+}
 
 }  // namespace mapping
 }  // namespace ori
